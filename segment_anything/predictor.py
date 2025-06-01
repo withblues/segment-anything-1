@@ -174,6 +174,7 @@ class SamPredictor:
         mask_input: Optional[torch.Tensor] = None,
         multimask_output: bool = True,
         return_logits: bool = False,
+        return_mask_embeddings: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Predict masks for the given input prompts, using the currently set image.
@@ -226,21 +227,33 @@ class SamPredictor:
         )
 
         # Predict masks
-        low_res_masks, iou_predictions = self.model.mask_decoder(
-            image_embeddings=self.features,
-            image_pe=self.model.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-        )
+        if return_mask_embeddings:
+          low_res_masks, iou_predictions, mask_tokens_out = self.model.mask_decoder(
+              image_embeddings=self.features,
+              image_pe=self.model.prompt_encoder.get_dense_pe(),
+              sparse_prompt_embeddings=sparse_embeddings,
+              dense_prompt_embeddings=dense_embeddings,
+              multimask_output=multimask_output,
+              return_mask_embeddings=True,
+          )
+        else:
+          low_res_masks, iou_predictions = self.model.mask_decoder(
+              image_embeddings=self.features,
+              image_pe=self.model.prompt_encoder.get_dense_pe(),
+              sparse_prompt_embeddings=sparse_embeddings,
+              dense_prompt_embeddings=dense_embeddings,
+              multimask_output=multimask_output,
+          )
 
         # Upscale the masks to the original image resolution
         masks = self.model.postprocess_masks(low_res_masks, self.input_size, self.original_size)
 
         if not return_logits:
             masks = masks > self.model.mask_threshold
-
-        return masks, iou_predictions, low_res_masks
+        if return_mask_embeddings:
+          return masks, iou_predictions, low_res_masks, mask_tokens_out
+        else:
+          return masks, iou_predictions, low_res_masks
 
     def get_image_embedding(self) -> torch.Tensor:
         """

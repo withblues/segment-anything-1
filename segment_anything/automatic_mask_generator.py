@@ -193,6 +193,7 @@ class SamAutomaticMaskGenerator:
 
         # Write mask records
         curr_anns = []
+        has_embeddings = 'embeddings' in mask_data
         for idx in range(len(mask_data["segmentations"])):
             ann = {
                 "segmentation": mask_data["segmentations"][idx],
@@ -203,6 +204,10 @@ class SamAutomaticMaskGenerator:
                 "stability_score": mask_data["stability_score"][idx].item(),
                 "crop_box": box_xyxy_to_xywh(mask_data["crop_boxes"][idx]).tolist(),
             }
+            
+            if has_embeddings:
+                ann["embeddings"] = mask_data["embeddings"][idx]
+  
             curr_anns.append(ann)
 
         return curr_anns
@@ -212,7 +217,7 @@ class SamAutomaticMaskGenerator:
         crop_boxes, layer_idxs = generate_crop_boxes(
             orig_size, self.crop_n_layers, self.crop_overlap_ratio
         )
-
+        
         # Iterate over image crops
         data = MaskData()
         data_s, data_m, data_l = MaskData(), MaskData(), MaskData()
@@ -307,6 +312,7 @@ class SamAutomaticMaskGenerator:
         data["crop_boxes"] = torch.tensor([crop_box for _ in range(len(data["rles"]))])
 
         return data
+    
 
     def _process_batch(
         self,
@@ -321,13 +327,23 @@ class SamAutomaticMaskGenerator:
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
         in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
         in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=in_points.device)
-        masks, iou_preds, _ = self.predictor.predict_torch(
+        masks, iou_preds, low_res_masks, mask_tokens_out = self.predictor.predict_torch(
             in_points[:, None, :],
             in_labels[:, None],
             multimask_output=True,
             return_logits=True,
+            return_mask_embeddings=True,
         )
-        # print('..............................................')
+
+        # print('...................points...........................')
+        # print(in_points.shape)
+        # print('...................embeddings...........................')
+        # print(mask_tokens_out.shape)
+        # print('...................low_res_mask...........................')
+        # print(low_res_masks.shape)
+        # print('...................mask...........................')
+        # print(masks.shape)
+
         # print(masks.shape)torch.Size([64, 3, 738, 994])
         # print(masks.flatten(0, 1).shape)torch.Size([192, 738, 994])
         # print(masks[:,0,:,:].shape)torch.Size([64, 738, 994]
@@ -340,21 +356,25 @@ class SamAutomaticMaskGenerator:
             masks=masks[:,0,:,:],
             iou_preds=iou_preds[:,0],
             points=torch.as_tensor(points),
+            embeddings=mask_tokens_out[:, 0, :],
         )
         data_m = MaskData(
             masks=masks[:,1,:,:],
             iou_preds=iou_preds[:,1],
             points=torch.as_tensor(points),
+            embeddings=mask_tokens_out[:, 1, :],
         )
         data_l = MaskData(
             masks=masks[:,2,:,:],
             iou_preds=iou_preds[:,2],
             points=torch.as_tensor(points),
+            embeddings=mask_tokens_out[:, 2, :],
         )
         data = MaskData(
             masks=masks.flatten(0, 1),
             iou_preds=iou_preds.flatten(0, 1),
             points=torch.as_tensor(points.repeat(masks.shape[1], axis=0)),
+            embeddings=mask_tokens_out.reshape(-1, mask_tokens_out.shape[-1])
         )
         del masks
 
