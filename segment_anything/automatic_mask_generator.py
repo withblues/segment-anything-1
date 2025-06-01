@@ -193,7 +193,7 @@ class SamAutomaticMaskGenerator:
 
         # Write mask records
         curr_anns = []
-        has_embeddings = 'embeddings' in mask_data
+        has_embeddings = 'embeddings' in mask_data._stats
         for idx in range(len(mask_data["segmentations"])):
             ann = {
                 "segmentation": mask_data["segmentations"][idx],
