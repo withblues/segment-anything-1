@@ -11,7 +11,7 @@ from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
 from typing import Any, Dict, List, Optional, Tuple
 
 from .modeling import Sam
-from .batched_predictor import BatchedSamPredictor
+from .predictor import SamPredictor
 from .utils.amg import (
     MaskData,
     area_from_rle,
@@ -120,7 +120,7 @@ class SamAutomaticMaskGenerator:
         # if min_mask_region_area > 0:
         #     import cv2  # type: ignore # noqa: F401
 
-        self.predictor = BatchedSamPredictor(model)
+        self.predictor = SamPredictor(model)
         self.points_per_batch = points_per_batch
         self.pred_iou_thresh = pred_iou_thresh
         self.stability_score_thresh = stability_score_thresh
@@ -160,17 +160,13 @@ class SamAutomaticMaskGenerator:
         """
 
         # Generate masks
-        all_image_mask_data = self._generate_batched_masks(images)
+        masks_data_l = self._generate_masks(images)
 
-        # Post-processing and formatting for each image
-        final_results_per_image = []
-        for mask_data_for_single_image in all_image_mask_data:
-            # Re-use your existing generate_curr_anns logic for each image's MaskData
-            # This handles min_mask_region_area, encoding, etc.
-            curr_anns = self.generate_curr_anns(mask_data_for_single_image)
-            final_results_per_image.append(curr_anns)
-        
-        return final_results_per_image
+        all_masks_l = []
+        for mask_data_l in masks_data_l:
+            curr_anns_l = self.generate_curr_anns(mask_data_l)
+            all_masks_l.append(curr_anns_l)
+        return all_masks_l
 
 
     def generate_curr_anns(
@@ -216,275 +212,36 @@ class SamAutomaticMaskGenerator:
 
         return curr_anns
 
-    def _generate_batched_masks(self, images: List[np.ndarray]) -> List[MaskData]:
-        all_crop_info_for_predictor = []
-        all_cropped_images_np = []
-
-        for original_image_idx, img_np in enumerate(images):
-            orig_size = img_np.shape[:2]
+    def _generate_masks(self, images: List[np.ndarray]) -> List[MaskData]:
+        images_data = []
+        for image in images:
+            orig_size = image.shape[:2]
             crop_boxes, layer_idxs = generate_crop_boxes(
                 orig_size, self.crop_n_layers, self.crop_overlap_ratio
             )
 
+            images_data.append((crop_boxes, layer_idxs, orig_size))
+
+        # vision encoder forward pass for a batch
+        results = self.predictor.set_images_batch(images)
+        
+        # Iterate over image crops
+        all_masks = []
+        for imgage_data, result in zip(images_data, results):
+            input_size = result['input_size']
+            features = result['features'].unsqueeze(0)
+            crop_boxes, layer_idxs, orig_size = imgage_data
+
+            data_l = MaskData()
             for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
-                x0, y0, x1, y1 = crop_box
-                cropped_im_np = img_np[y0:y1, x0:x1, :]
-                cropped_im_size = cropped_im_np.shape[:2]
-
-                all_cropped_images_np.append(cropped_im_np)
-                all_crop_info_for_predictor.append((original_image_idx, crop_box, layer_idx, orig_size, cropped_im_size))
-
-
-        # set images
-        self.predictor.set_images(all_cropped_images_np)
-
-        # collect all prompts for each image
-        all_prompts_coords_transformed = []
-        all_prompts_labels = []
-
-        # for mapping
-        prompt_to_original_image_idx = []
-        prompt_to_predictor_crop_idx = []
-
-        for predictor_crop_idx, (original_image_idx, crop_box, layer_idx, orig_size, cropped_im_size) in enumerate(all_crop_info_for_predictor):
-            points_scale = np.array(cropped_im_np)[None, ::-1]
-            points_for_image = self.point_grids[layer_idx] * points_scale
+                crop_data_l = self._process_crop(image, crop_box, layer_idx, orig_size, features, input_size)
+                
+                data_l.cat(crop_data_l)
             
-            # just like in _process_batch()
-            for (points_batch_np,) in batch_iterator(self.points_per_batch, points_for_image):
-                transformed_points_batch_np = self.predictor.transform.apply_coords(points_batch_np, cropped_im_size)
+            data_l = self._generate_masks_data(data_l, crop_boxes)
+            all_masks.append(data_l)
+        return all_masks
 
-                all_prompts_coords_transformed.append(torch.as_tensor(transformed_points_batch_np, device=self.predictor.device))
-                all_prompts_labels.append(torch.ones(transformed_points_batch_np.shape[0], dtype=torch.int,  device=self.predictor.device))
-
-                # store mapping indices
-                num_points_in_batch = transformed_points_batch_np.shape[0]
-                prompt_to_original_image_idx.extend([original_image_idx] * num_points_in_batch)
-                prompt_to_predictor_crop_idx.extend([predictor_crop_idx] * num_points_in_batch)
-
-        # create MaskData
-        #TODO
-
-        # create batch of prompts
-        final_prompts_coords = torch.cat([p[None, :, :] for p in all_prompts_coords_transformed], dim=0)
-        final_prompts_labels = torch.cat([l[None, :] for l in all_prompts_labels], dim=0)
-
-        final_prompt_original_image_indices_t = torch.as_tensor(prompt_to_original_image_idx, dtype=torch.long, device=self.predictor.device)
-        final_prompt_predictor_crop_indices_t = torch.as_tensor(prompt_to_predictor_crop_idx, dtype=torch.long, device=self.predictor.device)
-
-        masks_t, iou_preds_t, low_res_masks_t, mask_tokens_out_t = self.predictor.predict_torch_batch(
-            batch_idx=final_prompt_predictor_crop_indices_t,
-            point_coords=final_prompts_coords,
-            point_labels=final_prompts_labels,
-            multimask_output=True,
-            return_logits=True,
-            return_mask_embeddings=True
-        )
-
-
-        # flat out prediction
-        num_multimasks = masks_t.shape[1]
-        flat_masks = masks_t.flatten(0, 1)
-        flat_iou_preds = iou_preds_t.flatten(0, 1)
-        flat_points_coords = torch.repeat_interleave(final_prompts_coords, num_multimasks, dim=0)
-
-        flat_original_image_idx = torch.repeat_interleave(final_prompt_original_image_indices_t, num_multimasks, dim=0)
-        flat_predictor_crop_idx = torch.repeat_interleave(final_prompt_predictor_crop_indices_t, num_multimasks, dim=0)
-
-        # get embeddings 
-        flat_embeddings = mask_tokens_out_t.flatten(0, 1) if 'mask_tokens_out_t' in locals() else None
-
-        temp_all_mask_data = MaskData(
-            masks=flat_masks,
-            iou_preds=flat_iou_preds,
-            points=flat_points_coords.squeeze(1).cpu().numpy(),
-            original_image_idx=flat_original_image_idx,
-            predictor_crop_idx=flat_predictor_crop_idx,
-            embeddings=flat_embeddings,
-        )
-        
-        # process mask like _process_batch_data
-        temp_all_mask_data = self._apply_initial_filters_and_boxes_batched(temp_all_mask_data, all_crop_info_for_predictor)
-
-        final_image_mask_data_list = [MaskData() for _ in range(len(images))]
-        unique_image_indices = torch.unique(temp_all_mask_data["original_image_idx"])
-
-        for img_idx in unique_image_indices:
-            img_idx_mask = (temp_all_mask_data["original_image_idx"] == img_idx)
-
-            current_image_data = MaskData()
-            current_image_data["masks"] = temp_all_mask_data["masks"][img_idx_mask]
-            current_image_data["iou_preds"] = temp_all_mask_data["iou_preds"][img_idx_mask]
-            current_image_data["points"] = temp_all_mask_data["points"][img_idx_mask]
-            current_image_data["boxes"] = temp_all_mask_data["boxes"][img_idx_mask] 
-            current_image_data["stability_score"] = temp_all_mask_data["stability_score"][img_idx_mask]
-            current_image_data["rles"] = temp_all_mask_data["rles"][img_idx_mask]
-
-            # add crop boxes
-            processed_mask_data = MaskData(
-                masks=flat_masks,
-                iou_preds=flat_iou_preds,
-                points=flat_points_coords.squeeze(1).cpu().numpy(),
-                original_image_idx=flat_original_image_idx,
-                predictor_crop_idx=flat_predictor_crop_idx,
-                embeddings=flat_embeddings,
-            )
-
-            processed_mask_data = self._process_all_batched_prompts_and_masks(
-                processed_mask_data, all_crop_info_for_predictor
-            )
-
-            # filter through NMS
-            final_image_mask_data_list = [MaskData() for _ in range(len(images))]
-            unique_original_image_indices = torch.unique(processed_mask_data["original_image_idx"])
-
-            for img_idx in unique_original_image_indices:
-                img_mask = (processed_mask_data["original_image_idx"] == img_idx)
-
-                single_image_mask_data = MaskData()
-                single_image_mask_data["masks"] = processed_mask_data["masks"][img_mask]
-                single_image_mask_data["iou_preds"] = processed_mask_data["iou_preds"][img_mask]
-                single_image_mask_data["points"] = processed_mask_data["points"][img_mask]
-                single_image_mask_data["boxes"] = processed_mask_data["boxes"][img_mask]
-                single_image_mask_data["stability_score"] = processed_mask_data["stability_score"][img_mask]
-                single_image_mask_data["rles"] = processed_mask_data["rles"][img_mask]
-                single_image_mask_data["crop_boxes"] = processed_mask_data["crop_boxes"][img_mask]
-
-                if len(crop_boxes_for_image) > 1:
-                    scores = 1 / box_area(single_image_mask_data["crop_boxes"])
-                    scores = scores.to(self.predictor.device)
-
-                    keep_by_nms = batched_nms(
-                        single_image_mask_data["boxes"].float(),
-                        scores,
-                        torch.zeros_like(single_image_mask_data["boxes"][:, 0]), # categories
-                        iou_threshold=self.crop_nms_thresh,
-                    )
-                    single_image_mask_data.filter(keep_by_nms)
-
-                final_image_mask_data_list[img_idx] = single_image_mask_data
-
-            return final_image_mask_data_list
-        
-    def _process_all_batched_prompts_and_masks(
-        self,
-        batched_mask_data: MaskData, # Contains flat_masks, flat_iou_preds, flat_points, flat_original_image_idx, flat_predictor_crop_idx
-        all_crop_info_for_predictor: List[Tuple[int, List[int], int, Tuple[int,int], Tuple[int,int]]],
-    ) -> MaskData:
-        """
-        Applies initial filtering, calculates stability score, thresholds masks,
-        calculates boxes, filters by crop edge, and converts to RLEs for
-        the entire batch of mask candidates. Uncrops masks/boxes.
-        """
-        # Ensure all data is on the correct device for processing
-        masks = batched_mask_data["masks"]
-        iou_preds = batched_mask_data["iou_preds"]
-        points = batched_mask_data["points"] # np array
-        original_image_idx = batched_mask_data["original_image_idx"]
-        predictor_crop_idx = batched_mask_data["predictor_crop_idx"]
-        embeddings = batched_mask_data["embeddings"] if "embeddings" in batched_mask_data._stats else None
-
-
-        # 1. Filter by predicted IoU
-        if self.pred_iou_thresh > 0.0:
-            keep_mask_iou = iou_preds > self.pred_iou_thresh
-            masks = masks[keep_mask_iou]
-            iou_preds = iou_preds[keep_mask_iou]
-            points = points[keep_mask_iou.cpu().numpy()] # Filter numpy array
-            original_image_idx = original_image_idx[keep_mask_iou]
-            predictor_crop_idx = predictor_crop_idx[keep_mask_iou]
-            if embeddings is not None: embeddings = embeddings[keep_mask_iou]
-
-
-        # 2. Calculate stability score
-        stability_score = calculate_stability_score(
-            masks, self.predictor.model.mask_threshold, self.stability_score_offset
-        )
-        if self.stability_score_thresh > 0.0:
-            keep_mask_stability = stability_score >= self.stability_score_thresh
-            masks = masks[keep_mask_stability]
-            iou_preds = iou_preds[keep_mask_stability]
-            points = points[keep_mask_stability.cpu().numpy()]
-            original_image_idx = original_image_idx[keep_mask_stability]
-            predictor_crop_idx = predictor_crop_idx[keep_mask_stability]
-            stability_score = stability_score[keep_mask_stability]
-            if embeddings is not None: embeddings = embeddings[keep_mask_stability]
-
-
-        # 3. Threshold masks and calculate boxes
-        # This also generates boxes in the original image coordinate system
-        thresholded_masks = masks > self.predictor.model.mask_threshold
-        boxes = batched_mask_to_box(thresholded_masks) # boxes are in original image coordinates
-        
-        # 4. Filter boxes that touch crop boundaries (this needs individual crop_box and orig_size)
-        # This is where a loop or a more complex batched operation is needed.
-        keep_mask_crop_edge = torch.ones(len(boxes), dtype=torch.bool, device=self.predictor.device)
-        
-        # Collect relevant crop_boxes and original_sizes for each remaining mask
-        relevant_crop_boxes_for_masks = []
-        relevant_orig_sizes_for_masks = []
-        
-        # This mapping is crucial:
-        # map `predictor_crop_idx` (which refers to index in all_cropped_images_np)
-        # to the corresponding `all_crop_info_for_predictor` entry
-        for i, p_crop_idx in enumerate(predictor_crop_idx):
-            _, crop_box, _, orig_size, _ = all_crop_info_for_predictor[p_crop_idx]
-            relevant_crop_boxes_for_masks.append(crop_box)
-            relevant_orig_sizes_for_masks.append(orig_size) # Not directly used for `is_box_near_crop_edge` but good to have
-
-        # Convert list of lists (crop_box) to a tensor if all have same inner dim, or iterate.
-        # `is_box_near_crop_edge` takes a single box and single target_box.
-        # We need to iterate this check.
-        
-        # Loop through the masks and apply crop edge filter individually
-        # This could be optimized if `is_box_near_crop_edge` was batched.
-        # For now, let's do it sequentially and build a boolean tensor.
-        
-        final_keep_indices = []
-        final_uncropped_crop_boxes = [] # To store the uncropped crop_box for each mask
-        
-        for i in range(len(boxes)):
-            box = boxes[i]
-            crop_b = relevant_crop_boxes_for_masks[i]
-            orig_s = relevant_orig_sizes_for_masks[i] # orig_h, orig_w
-            
-            # Check if box is near crop edge (using original image boundaries as target)
-            if not is_box_near_crop_edge(box.unsqueeze(0), crop_b, [0, 0, orig_s[1], orig_s[0]]): # target_box is [x0,y0,x1,y1] -> [0,0,W,H]
-                final_keep_indices.append(i)
-                final_uncropped_crop_boxes.append(crop_b) # Store the original crop box for this mask
-
-        # Filter all tensors by `final_keep_indices`
-        masks = masks[final_keep_indices]
-        iou_preds = iou_preds[final_keep_indices]
-        points = points[np.array(final_keep_indices)] # Filter numpy array with numpy index
-        original_image_idx = original_image_idx[final_keep_indices]
-        predictor_crop_idx = predictor_crop_idx[final_keep_indices]
-        stability_score = stability_score[final_keep_indices]
-        boxes = boxes[final_keep_indices]
-        if embeddings is not None: embeddings = embeddings[final_keep_indices]
-        final_uncropped_crop_boxes_t = torch.as_tensor(final_uncropped_crop_boxes, device=self.predictor.device)
-
-
-        # 5. Compress to RLE (masks are already uncropped by BatchedSamPredictor)
-        rles = mask_to_rle_pytorch(masks) # masks should be (N, H, W) now
-
-        # Create the output MaskData for this stage
-        output_mask_data = MaskData(
-            masks=masks, # Keep for debugging if needed, but will be removed
-            iou_preds=iou_preds,
-            points=points, # Already numpy
-            stability_score=stability_score,
-            boxes=boxes,
-            rles=rles,
-            original_image_idx=original_image_idx,
-            crop_boxes=final_uncropped_crop_boxes_t, # These are the original crop boxes for each final mask
-        )
-        if embeddings is not None:
-            output_mask_data["embeddings"] = embeddings
-
-        del output_mask_data["masks"] # Remove large masks tensor if not needed later
-
-        return output_mask_data
 
     def _generate_masks_data(
             self,
@@ -515,33 +272,30 @@ class SamAutomaticMaskGenerator:
         crop_box: List[int],
         crop_layer_idx: int,
         orig_size: Tuple[int, ...],
+        features,
+        input_size,
     ) -> MaskData:
         # Crop the image and calculate embeddings
         x0, y0, x1, y1 = crop_box
         cropped_im = image[y0:y1, x0:x1, :]
         cropped_im_size = cropped_im.shape[:2]
-        self.predictor.set_image(cropped_im)
+        #self.predictor.set_image(cropped_im)
+        self.predictor.set_calculated_image(input_size, orig_size, features)
 
         # Get points for this crop
         points_scale = np.array(cropped_im_size)[None, ::-1]
         points_for_image = self.point_grids[crop_layer_idx] * points_scale
 
         # Generate masks for this crop in batches
-        data = MaskData()
-        data_s, data_m, data_l = MaskData(), MaskData(), MaskData()
+        data_l = MaskData()
         for (points,) in batch_iterator(self.points_per_batch, points_for_image):
-            batch_data, batch_data_s, batch_data_m, batch_data_l = self._process_batch(points, cropped_im_size, crop_box, orig_size)
-            data.cat(batch_data)
-            data_s.cat(batch_data_s)
-            data_m.cat(batch_data_m)
+            batch_data_l = self._process_batch(points, cropped_im_size, crop_box, orig_size)
             data_l.cat(batch_data_l)
-            del batch_data, batch_data_s, batch_data_m, batch_data_l
+            del batch_data_l
         self.predictor.reset_image()
-        data = self._process_crop_data(data, crop_box)
-        data_s = self._process_crop_data(data_s, crop_box)
-        data_m = self._process_crop_data(data_m, crop_box)
+      
         data_l = self._process_crop_data(data_l, crop_box)
-        return data, data_s, data_m, data_l
+        return data_l
 
 
     def _process_crop_data(
@@ -604,37 +358,38 @@ class SamAutomaticMaskGenerator:
         # print(iou_preds.shape)torch.Size([64, 3])
         # Serialize predictions and store in MaskData
         # mask type: s m l
-        data_s = MaskData(
-            masks=masks[:,0,:,:],
-            iou_preds=iou_preds[:,0],
-            points=torch.as_tensor(points),
-            embeddings=mask_tokens_out[:, 0, :],
-        )
-        data_m = MaskData(
-            masks=masks[:,1,:,:],
-            iou_preds=iou_preds[:,1],
-            points=torch.as_tensor(points),
-            embeddings=mask_tokens_out[:, 1, :],
-        )
+        # data_s = MaskData(
+        #     masks=masks[:,0,:,:],
+        #     iou_preds=iou_preds[:,0],
+        #     points=torch.as_tensor(points),
+        #     embeddings=mask_tokens_out[:, 0, :],
+        # )
+        # data_m = MaskData(
+        #     masks=masks[:,1,:,:],
+        #     iou_preds=iou_preds[:,1],
+        #     points=torch.as_tensor(points),
+        #     embeddings=mask_tokens_out[:, 1, :],
+        # )
         data_l = MaskData(
             masks=masks[:,2,:,:],
             iou_preds=iou_preds[:,2],
             points=torch.as_tensor(points),
             embeddings=mask_tokens_out[:, 2, :],
         )
-        data = MaskData(
-            masks=masks.flatten(0, 1),
-            iou_preds=iou_preds.flatten(0, 1),
-            points=torch.as_tensor(points.repeat(masks.shape[1], axis=0)),
-            embeddings=mask_tokens_out.reshape(-1, mask_tokens_out.shape[-1])
-        )
+        # data = MaskData(
+        #     masks=masks.flatten(0, 1),
+        #     iou_preds=iou_preds.flatten(0, 1),
+        #     points=torch.as_tensor(points.repeat(masks.shape[1], axis=0)),
+        #     embeddings=mask_tokens_out.reshape(-1, mask_tokens_out.shape[-1])
+        # )
         del masks
 
-        data = self._process_batch_data(data, crop_box, orig_w, orig_h)
-        data_s = self._process_batch_data(data_s, crop_box, orig_w, orig_h)
-        data_m = self._process_batch_data(data_m, crop_box, orig_w, orig_h)
+        #data = self._process_batch_data(data, crop_box, orig_w, orig_h)
+        #data_s = self._process_batch_data(data_s, crop_box, orig_w, orig_h)
+        #data_m = self._process_batch_data(data_m, crop_box, orig_w, orig_h)
         data_l = self._process_batch_data(data_l, crop_box, orig_w, orig_h)
-        return data, data_s, data_m, data_l
+        #return data, data_s, data_m, data_l
+        return data_l
     
     def _process_batch_data(
             self,

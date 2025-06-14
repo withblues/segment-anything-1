@@ -9,7 +9,7 @@ import torch
 
 from segment_anything.modeling import Sam
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Union
 
 from .utils.transforms import ResizeLongestSide
 
@@ -280,3 +280,136 @@ class SamPredictor:
         self.orig_w = None
         self.input_h = None
         self.input_w = None
+
+    def set_images_batch(
+        self,
+        images: List[np.ndarray],
+        image_format: str = "RGB",
+    ) -> List[Dict[str, Union[Tuple[int, int], torch.Tensor]]]:
+        assert image_format in [
+            "RGB",
+            "BGR",
+        ], f"image_format must be in ['RGB', 'BGR'], is {image_format}."
+
+        original_sizes: List[Tuple[int, ...]] = []
+        input_sizes: List[Tuple[int, ...]] = []
+        transformed_images_list: List[torch.Tensor] = []
+
+        # Determine the target size for padding based on the model's expected image size
+        # This assumes your model.image_encoder.img_size is the target square dimension (e.g., 1024)
+        model_img_size = self.model.image_encoder.img_size # e.g., 1024
+        target_h, target_w = model_img_size, model_img_size # Pad to a square
+
+        for image in images:
+            current_image = image
+            if image_format != self.model.image_format:
+                current_image = current_image[..., ::-1]
+
+            original_sizes.append(current_image.shape[:2])
+
+            # Apply transformation (e.g., ResizeLongestSide)
+            # This step resizes the longest side to `model_img_size`
+            # The output `input_image_np` will have varying H, W based on aspect ratio
+            input_image_np = self.transform.apply_image(current_image)
+            input_sizes.append(input_image_np.shape[:2])
+
+            # Convert to PyTorch tensor and permute dimensions (HWC -> CHW)
+            input_image_torch = torch.as_tensor(input_image_np, device=self.device)
+            input_image_torch = input_image_torch.permute(2, 0, 1).contiguous() # Shape 3xHxW
+
+            # --- Add Padding Here ---
+            # Calculate padding needed to reach target_h x target_w
+            # PyTorch's F.pad expects (left, right, top, bottom)
+            # This pads the image to a square shape, typically 1024x1024 for SAM
+            pad_h = max(0, target_h - input_image_torch.shape[1])
+            pad_w = max(0, target_w - input_image_torch.shape[2])
+            
+            # Apply padding. SAM typically pads with 0s.
+            # (left, right, top, bottom) -> (pad_left, pad_right, pad_top, pad_bottom)
+            # For simplicity, we can pad symmetrically or just to the bottom/right
+            # The original SAM's `model.preprocess` uses F.pad which handles the full padding logic.
+            # You might want to replicate SAM's exact padding if it's crucial for the model.
+            # A common approach is to pad to the bottom-right.
+            padded_image_torch = torch.nn.functional.pad(
+                input_image_torch,
+                (0, pad_w, 0, pad_h), # (left, right, top, bottom)
+                mode='constant',
+                value=0
+            )
+            # --- End Padding ---
+
+            transformed_images_list.append(padded_image_torch)
+
+        # Stack all transformed and padded images into a single batch tensor (NxCxHxW)
+        # Now all tensors in transformed_images_list should be of the same HxW (e.g., 1024x1024)
+        transformed_images_batch = torch.stack(transformed_images_list, dim=0)
+
+        # Process the batched images through the model
+        results = self._process_torch_images_batch(transformed_images_batch, original_sizes, input_sizes)
+        return results
+
+    @torch.no_grad()
+    def _process_torch_images_batch(
+        self,
+        transformed_images: torch.Tensor,
+        original_image_sizes: List[Tuple[int, ...]],
+        input_image_sizes: List[Tuple[int, ...]],
+    ) -> List[Dict[str, Union[Tuple[int, int], Tuple[int, int], torch.Tensor]]]:
+        """
+        Internal helper function to calculate image embeddings for a batch of
+        already transformed images.
+
+        Arguments:
+          transformed_images (torch.Tensor): A batch of input images, with shape
+            Nx3xHxW, which have been transformed (e.g., with ResizeLongestSide).
+          original_image_sizes (List[tuple(int, int)]): A list of the original sizes
+            of the images before transformation, in (H, W) format, corresponding
+            to the order in `transformed_images`.
+
+        Returns:
+          List[Dict[str, Union[Tuple[int, int], Tuple[int, int], torch.Tensor]]]:
+            A list of dictionaries, where each dictionary corresponds to an input image
+            and contains:
+            - 'original_size': The original (H, W) size of the image before transformation.
+            - 'input_size': The (H, W) size of the image after transformation, as input to the model.
+            - 'features': The torch.Tensor containing the image embeddings for that specific image.
+        """
+        num_images_in_batch = transformed_images.shape[0]
+        assert (
+            len(transformed_images.shape) == 4
+            and transformed_images.shape[1] == 3
+            and max(*transformed_images.shape[2:]) == self.model.image_encoder.img_size
+        ), (
+            f"'_process_torch_images_batch' input must be Nx3xHxW where long side "
+            f"is {self.model.image_encoder.img_size}. Got shape {transformed_images.shape}."
+        )
+        assert len(original_image_sizes) == num_images_in_batch, (
+            f"Number of original image sizes ({len(original_image_sizes)}) must match "
+            f"the batch size of transformed images ({num_images_in_batch})."
+        )
+
+        # Preprocess the batched images
+        # This typically involves normalization and moving to model's expected input range
+        input_images_preprocessed = self.model.preprocess(transformed_images)
+
+        # Pass the batched images through the image encoder
+        # This will return features with shape (N, C, H_feat, W_feat)
+        features_batch = self.model.image_encoder(input_images_preprocessed)
+
+
+        results: List[Dict[str, Union[Tuple[int, int], Tuple[int, int], torch.Tensor]]] = []
+        for i in range(num_images_in_batch):
+            results.append({
+                'original_size': original_image_sizes[i],
+                'input_size': input_image_sizes[i],
+                'features': features_batch[i] # Extract features for each individual image
+            })
+        return results
+    
+    def set_calculated_image(self, input_size, original_image_size, features):
+        self.reset_image()
+
+        self.original_size = original_image_size
+        self.input_size = input_size
+        self.features = features
+        self.is_image_set = True
