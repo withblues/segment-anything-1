@@ -394,7 +394,15 @@ class SamPredictor:
 
         # Pass the batched images through the image encoder
         # This will return features with shape (N, C, H_feat, W_feat)
-        features_batch = self.model.image_encoder(input_images_preprocessed)
+        x = self.model.image_encoder.patch_embed(input_images_preprocessed)
+        if self.model.image_encoder.pos_embed is not None:
+          x = x + self.model.image_encoder.pos_embed
+
+        for blk in self.model.image_encoder.blocks:
+          x = blk(x)
+
+        last_transformer_block = x.to('cpu').numpy()
+        features_batch = self.model.image_encoder.neck(x.permute(0, 3, 1, 2))
 
 
         results: List[Dict[str, Union[Tuple[int, int], Tuple[int, int], torch.Tensor]]] = []
@@ -402,7 +410,8 @@ class SamPredictor:
             results.append({
                 'original_size': original_image_sizes[i],
                 'input_size': input_image_sizes[i],
-                'features': features_batch[i] # Extract features for each individual image
+                'features': features_batch[i], # Extract features for each individual image
+                'last_transformer_block': last_transformer_block[i]
             })
         return results
     
