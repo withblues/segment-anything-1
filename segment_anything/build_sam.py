@@ -105,3 +105,34 @@ def _build_sam(
             state_dict = torch.load(f)
         sam.load_state_dict(state_dict)
     return sam
+
+def build_sam_image_encoder_vit_h(checkpoint=None):
+    sam = Sam(
+        image_encoder = ImageEncoderViT(
+            depth=32,
+            embed_dim=1280,
+            img_size=1024,
+            mlp_ratio=4,
+            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            num_heads=16,
+            patch_size=16,
+            qkv_bias=True,
+            use_rel_pos=True,
+            global_attn_indexes=[7, 15, 23, 31],
+            window_size=14,
+            out_chans=256,  # must match prompt encoder’s expectation
+        ),
+        prompt_encoder=None,
+        mask_decoder=None,
+        pixel_mean=[123.675, 116.28, 103.53],
+        pixel_std=[58.395, 57.12, 57.375],
+    )
+    sam.eval()
+    if checkpoint is not None:
+        state_dict = torch.load(checkpoint, weights_only=True)
+        # filter only the keys belonging to the image encoder
+        image_encoder_weights = {k.replace("image_encoder.", ""): v
+                                for k, v in state_dict.items()
+                                if k.startswith("image_encoder.")}
+        sam.image_encoder.load_state_dict(image_encoder_weights)
+    return sam

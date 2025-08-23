@@ -10,6 +10,7 @@ from .build_sam import (
     build_sam_vit_l,
     build_sam_vit_b,
     sam_model_registry,
+    build_sam_image_encoder_vit_h
 )
 from .predictor import SamPredictor
 from .automatic_mask_generator import SamAutomaticMaskGenerator
