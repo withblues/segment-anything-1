@@ -285,6 +285,7 @@ class SamPredictor:
         self,
         images: List[np.ndarray],
         image_format: str = "RGB",
+        return_transformer_only: bool = False,
     ) -> List[Dict[str, Union[Tuple[int, int], torch.Tensor]]]:
         assert image_format in [
             "RGB",
@@ -345,7 +346,7 @@ class SamPredictor:
         transformed_images_batch = torch.stack(transformed_images_list, dim=0)
 
         # Process the batched images through the model
-        results = self._process_torch_images_batch(transformed_images_batch, original_sizes, input_sizes)
+        results = self._process_torch_images_batch(transformed_images_batch, original_sizes, input_sizes, return_transformer_only)
         return results
 
     @torch.no_grad()
@@ -354,6 +355,7 @@ class SamPredictor:
         transformed_images: torch.Tensor,
         original_image_sizes: List[Tuple[int, ...]],
         input_image_sizes: List[Tuple[int, ...]],
+        return_transformer_only: bool = False,
     ) -> List[Dict[str, Union[Tuple[int, int], Tuple[int, int], torch.Tensor]]]:
         """
         Internal helper function to calculate image embeddings for a batch of
@@ -400,6 +402,10 @@ class SamPredictor:
 
         for blk in self.model.image_encoder.blocks:
           x = blk(x)
+
+        # mimic image encoder forward pass until last transformer block
+        if return_transformer_only:
+            return x
 
         last_transformer_block = x.to('cpu').numpy()
         features_batch = self.model.image_encoder.neck(x.permute(0, 3, 1, 2))
