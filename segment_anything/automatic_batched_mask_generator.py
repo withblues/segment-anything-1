@@ -339,7 +339,8 @@ class SamAutomaticMaskGenerator:
 
         # Run model on this batch
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
-        in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
+        model_dtype = next(self.predictor.model.parameters()).dtype
+        in_points = torch.as_tensor(transformed_points, dtype=model_dtype, device=self.predictor.device)
         in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=in_points.device)
         masks, iou_preds, low_res_masks, mask_tokens_out = self.predictor.predict_torch(
             in_points[:, None, :],
