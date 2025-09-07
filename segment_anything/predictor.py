@@ -407,7 +407,7 @@ class SamPredictor:
         if return_transformer_only:
             return x
 
-        last_transformer_block = x.to('cpu').numpy()
+        last_transformer_block = x.to('cpu').float().numpy()
         features_batch = self.model.image_encoder.neck(x.permute(0, 3, 1, 2))
 
 
